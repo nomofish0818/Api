@@ -5,6 +5,7 @@ import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.handler.codec.http.*;
+import io.netty.util.ReferenceCountUtil;
 
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -19,12 +20,15 @@ public class GatewayInboundHandler extends SimpleChannelInboundHandler<FullHttpR
             .version(HttpClient.Version.HTTP_1_1)
             .connectTimeout(Duration.ofSeconds(10))
             .build();
-
     private static final String TARGET_URL = "http://httpbin.org/get";
 
     @Override
     protected void channelRead0(ChannelHandlerContext ctx, FullHttpRequest nettyRequest) {
-        System.out.println("收到请求，正通过原生 HttpClient 转发至: " + TARGET_URL);
+        // 1. 增加引用计数，防止 SimpleChannelInboundHandler 在方法结束时自动释放它
+        nettyRequest.retain();
+
+        // 2. 判断客户端是否要求 Keep-Alive
+        boolean keepAlive = HttpUtil.isKeepAlive(nettyRequest);
 
         HttpRequest.Builder requestBuilder = HttpRequest.newBuilder()
                 .uri(URI.create(TARGET_URL))
@@ -32,24 +36,31 @@ public class GatewayInboundHandler extends SimpleChannelInboundHandler<FullHttpR
 
         httpClient.sendAsync(requestBuilder.build(), HttpResponse.BodyHandlers.ofByteArray())
                 .whenComplete((response, throwable) -> {
-                    if (throwable != null) {
-                        System.err.println("转发失败: " + throwable.getMessage());
-                        FullHttpResponse errorResponse = new DefaultFullHttpResponse(
-                                HttpVersion.HTTP_1_1, HttpResponseStatus.BAD_GATEWAY);
-                        ctx.writeAndFlush(errorResponse).addListener(ChannelFutureListener.CLOSE);
-                    } else {
-                        FullHttpResponse nettyResponse = new DefaultFullHttpResponse(
-                                HttpVersion.HTTP_1_1,
-                                HttpResponseStatus.valueOf(response.statusCode()),
-                                Unpooled.wrappedBuffer(response.body())
-                        );
+                    try {
+                        FullHttpResponse nettyResponse;
+                        if (throwable != null) {
+                            System.err.println("转发失败: " + throwable.getMessage());
+                            nettyResponse = new DefaultFullHttpResponse(
+                                    HttpVersion.HTTP_1_1, HttpResponseStatus.BAD_GATEWAY);
+                        } else {
+                            nettyResponse = new DefaultFullHttpResponse(
+                                    HttpVersion.HTTP_1_1,
+                                    HttpResponseStatus.valueOf(response.statusCode()),
+                                    Unpooled.wrappedBuffer(response.body())
+                            );
+                        }
 
-                        nettyResponse.headers().setInt(
-                                HttpHeaderNames.CONTENT_LENGTH,
-                                nettyResponse.content().readableBytes()
-                        );
-
-                        ctx.writeAndFlush(nettyResponse).addListener(ChannelFutureListener.CLOSE);
+                        // 3. 处理 Keep-Alive 和 Content-Length 头部
+                        nettyResponse.headers().setInt(HttpHeaderNames.CONTENT_LENGTH, nettyResponse.content().readableBytes());
+                        if (keepAlive) {
+                            nettyResponse.headers().set(HttpHeaderNames.CONNECTION, HttpHeaderValues.KEEP_ALIVE);
+                            ctx.writeAndFlush(nettyResponse); // 不加 CLOSE listener
+                        } else {
+                            ctx.writeAndFlush(nettyResponse).addListener(ChannelFutureListener.CLOSE);
+                        }
+                    } finally {
+                        // 4. 异步处理彻底结束，手动释放最初始的请求内存
+                        ReferenceCountUtil.release(nettyRequest);
                     }
                 });
     }
